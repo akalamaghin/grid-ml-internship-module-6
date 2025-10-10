@@ -211,3 +211,5 @@ airflow/config/*
 !.gitkeep
 airflow/logs/*
 !.gitkeep
+airflow/data/*
+!.gitkeep
