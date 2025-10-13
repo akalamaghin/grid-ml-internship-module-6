@@ -46,6 +46,10 @@ Make sure Docker has at least 2 CPU cores and 4 GB of RAM allocated to run thi
 
 ## Testing the Solution
 
+### Loading the Dataset
+
+Download final_dataset.csv from `https://www.kaggle.com/datasets/devendra416/ddos-datasets` rename the file to full_ddos_dataset.csv and put it in the `airflow/data/` folder.
+
 ### Loading DAGs
 
 To load and tset the capstone project DAGs, place the .py files from the `task_dags/` into the `airflow/dags/` folder. Airflow will automatically load them within approximately 45 seconds.
