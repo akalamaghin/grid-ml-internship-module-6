@@ -1,14 +1,13 @@
-from airflow.sdk import DAG
+from airflow.sdk import DAG, Variable
 from airflow.providers.standard.operators.python import PythonOperator
 import random
 import csv
 from datetime import datetime
-from airflow.task.trigger_rule import TriggerRule
-from custom_operators import XComExecStatusOperator
 
-KEEP_COL_NAMES = ["Flow ID", "Timestamp", "Label"]
-INPUT_FILE = "/var/tmp/airflow/data/full_dddos_dataset.csv"
-OUTPUT_FILE = "/var/tmp/airflow/data/ddos_dataset_10_rand.csv"
+
+KEEP_COL_NAMES = Variable.get("KEEP_COL_NAMES", "Flow ID|Timestamp|Label").split('|')
+INPUT_FILE = Variable.get("FULL_DATA_FILE", "/var/tmp/airflow/data/full_ddos_dataset.csv")
+OUTPUT_FILE = Variable.get("SELECTED_DATA_FILE", "/var/tmp/airflow/data/ddos_dataset_10_rand.csv")
 
 
 with DAG(
@@ -27,7 +26,7 @@ with DAG(
             col_indexes = [header.index(name) for name in KEEP_COL_NAMES]
             writer.writerow(KEEP_COL_NAMES)
 
-            for _ in range(9):
+            for _ in range(10):
                 step = random.randint(1, 10000)
 
                 for _ in range(step - 1):
@@ -43,20 +42,3 @@ with DAG(
         task_id="pick_10_rand_records",
         python_callable=pick_10_rand_records
     )
-
-    push_exec_status_failed_task = XComExecStatusOperator(
-        task_id="push_exec_status_failed",
-        failed=True,
-        trigger_rule=TriggerRule.ALL_FAILED
-    )
-
-    push_exec_status_succeed_task = XComExecStatusOperator(
-        task_id="push_exec_status_succeed",
-        failed=False,
-        trigger_rule=TriggerRule.ALL_SUCCESS
-    )
-
-    (
-        pick_10_rand_records_task
-            >> [push_exec_status_failed_task, push_exec_status_succeed_task]
-    ) # type: ignore

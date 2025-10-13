@@ -1,22 +1,33 @@
-from airflow.sdk import DAG
+from airflow.sdk import DAG, Variable
 from datetime import datetime, timedelta
-from airflow.utils.state import State
 from airflow.providers.standard.sensors.python import PythonSensor
 from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 from airflow.providers.standard.operators.python import PythonOperator, BranchPythonOperator
-import csv
 from airflow.task.trigger_rule import TriggerRule
-from custom_operators import XComExecStatusOperator
+import requests
+import csv
 
 
-INPUT_FILE = "/var/tmp/airflow/data/ddos_dataset_10_rand.csv"
-TARGET_DAG_ID = "dag_a"
+INPUT_FILE = Variable.get(
+    "SELECTED_DATA_FILE",
+    "/var/tmp/airflow/data/ddos_dataset_10_rand.csv"
+)
 
-POSTGRES_CONN_ID = "postgres_default"
-TABLE_SCHEMA = "public"
-TABLE_NAME = "ddos_data"
+TARGET_DAG_ID = Variable.get("TARGET_DAG_ID", "dag_a")
 
-DAG_STATUS_TASKS = ["push_exec_status_succeed", "push_exec_status_failed"]
+POSTGRES_CONN_ID = Variable.get("POSTGRES_CONN_ID", "postgres_default")
+TABLE_SCHEMA = Variable.get("TABLE_SCHEMA", "public")
+TABLE_NAME = Variable.get("TABLE_NAME", "ddos_data")
+
+AIRFLOW_URL_BASE = (
+    f"http://{Variable.get("AIRFLOW_API_HOST", "airflow-apiserver")}:"
+    f"{Variable.get("AIRFLOW_API_PORT", "8080")}/"
+)
+AIRFLOW_API_BASE = AIRFLOW_URL_BASE + "api/v2/"
+
+AIRFLOW_USERNAME = Variable.get("AIRFLOW_USERNAME")
+AIRFLOW_PASSWORD = Variable.get("AIRFLOW_PASSWORD")
+
 
 with DAG(
     dag_id="dag_b",
@@ -25,44 +36,88 @@ with DAG(
     catchup=False
 ) as dag:
     
-    def check_previous_runs(**context):
-        ti = context["ti"]
+    def get_airflow_token() -> str:
+        """Authenticate in Airflow API to get a Bearer token."""
 
-        last_a_status = None
-        for task_id in DAG_STATUS_TASKS:
-            last_a_status = ti.xcom_pull(
-                dag_id=TARGET_DAG_ID,
-                task_ids=task_id,
-                key="exec_status"
-            )
+        url = f"{AIRFLOW_URL_BASE}auth/token"
+        payload = {
+            "username": AIRFLOW_USERNAME,
+            "password": AIRFLOW_PASSWORD,
+        }
 
-            if last_a_status is not None:
-                break
+        response = requests.post(url, json=payload, timeout=10)
+        if not response.ok:
+            raise RuntimeError(f"Failed to obtain auth token: {response.text}")
+
+        token = response.json().get("access_token")
+        if not token:
+            raise RuntimeError("Token missing from response")
         
-        if last_a_status is None:
-            last_a_status = State.NONE
+        return token
 
-        if last_a_status != State.SUCCESS:
-            print(f"Last dag_a exec_status: {last_a_status}. Will retry in 5 minutes...") # type: ignore
+    def get_prev_dagrun(dag_id, offset = 0, limit = 1):
+        """
+        Fetch one of the previous DAG runs by dag_id from Airflow API,
+        ordered by logical_date DESC.
+        """
+        
+        token = get_airflow_token()
+
+        url = f"{AIRFLOW_API_BASE}dags/{dag_id}/dagRuns"
+        params = {
+            "order_by": "-logical_date",
+            "limit": limit,
+            "offset": offset,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        if not response.ok:
+            raise RuntimeError(f"Failed to fetch runs for {dag_id}: {response.text}")
+
+        data = response.json()
+        runs = data.get("dag_runs", [])
+        if not runs:
+            return None
+
+        return runs[0]
+
+    def check_previous_runs(**context):
+        """
+        Check(?) the last run of this dag and check that
+        the last run of <TARGET_DAG_ID> succeeded before proceeding.
+        """
+
+        # It's unclear what exactly "Have a sensor to check the state of the previous run of B..."
+        # is meant to cover — whether it refers to ensuring no other instance is running, or
+        # simply verifying that we can fetch the run preceding the current one.
+        # For now, this implementation only logs the result.
+        # If more specific behavior is required, please open an issue should to clarify.
+        this_dag = context["dag"].dag_id
+        last_this_run = get_prev_dagrun(this_dag, offset=1)
+        if last_this_run:
+            print(f"Prev {this_dag} run: {last_this_run['logical_date']} (state={last_this_run['state']})")
+        else:
+            print(f"Prev {this_dag} run: Not Found!")
+
+        last_target_run = get_prev_dagrun(TARGET_DAG_ID)
+        if last_target_run is None:
+            print(f"Last {TARGET_DAG_ID} run: Not Found! Need to retry...")
             return False
 
-        prev_b_status = None
-        for task_id in DAG_STATUS_TASKS:
-            prev_b_status = ti.xcom_pull(
-                dag_id="dag_b",
-                task_ids=task_id,
-                key="exec_status"
-            )
-            if prev_b_status is not None:
-                break
+        last_target_state = last_target_run["state"].lower()
+        print(f"Last {TARGET_DAG_ID} run: {last_target_run['logical_date']} (state={last_target_state})")
 
-        if prev_b_status is None:
-            prev_b_status = State.NONE
-
-        # From the task definition it is not clear if something
-        # should depend on this status, so I'll just log it for now
-        print(f"Previous dag_b exec_status: {prev_b_status}") # type: ignore
-
+        if last_target_state != "success":
+            print(f"Last {TARGET_DAG_ID} run: Failed! Need to retry...")
+            return False
+        else:
+            print(f"Last {TARGET_DAG_ID} run: Succeed! Proceeding...")
+        
         return True
 
     check_previous_runs_task = PythonSensor(
@@ -95,12 +150,15 @@ with DAG(
         python_callable=check_table_exists
     )
 
+    def fmt_col_name(col):
+        return col.lower().replace(" ", "_").replace("/", "_")
+
     def create_table(**context):
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
         with open(INPUT_FILE, newline="") as f:
             reader = csv.reader(f)
-            columns = [col.lower().replace(" ", "_").replace("/", "_") for col in next(reader)]
+            columns = [fmt_col_name(col) for col in next(reader)]
 
         columns_sql = ",\n".join([f"{col} VARCHAR" for col in columns])
         sql = (
@@ -126,7 +184,7 @@ with DAG(
 
         with open(INPUT_FILE, newline="") as f:
             reader = csv.DictReader(f)
-            fieldnames = [name.lower().replace(" ", "_").replace("/", "_") for name in reader.fieldnames] # type: ignore
+            fieldnames = [fmt_col_name(name) for name in reader.fieldnames] # type: ignore
 
             n = 0
             for row in reader:
@@ -149,18 +207,6 @@ with DAG(
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
     )
 
-    push_exec_status_failed_task = XComExecStatusOperator(
-        task_id="push_exec_status_failed",
-        failed=True,
-        trigger_rule=TriggerRule.ALL_FAILED
-    )
-
-    push_exec_status_succeed_task = XComExecStatusOperator(
-        task_id="push_exec_status_succeed",
-        failed=False,
-        trigger_rule=TriggerRule.ALL_SUCCESS
-    )
-
     (
         check_previous_runs_task
             >> check_table_exists_task
@@ -170,5 +216,4 @@ with DAG(
     (
         create_table_task 
             >> insert_rows_task
-                >> [push_exec_status_failed_task, push_exec_status_succeed_task]
     )   # type: ignore
