@@ -1,4 +1,4 @@
-# Arteom Kalamaghin - Apache Airflow Capstone Project
+# Arteom Kalamaghin - Apache Airflow Practical Task
 
 ## Deployment
 
